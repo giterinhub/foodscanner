@@ -199,6 +199,69 @@ class TgtgClient:
         response = self._request("POST", url, json=payload, auth_required=True)
         return response.json()
 
+    def confirm_by_email_link(self, link):
+        # Extract user_id and token from link
+        # Link format: https://space.toogoodtogo.com/login/accept/{user_id}/{token}
+        try:
+            # Handle both full URL and just the path if user pastes weirdly
+            if "/login/accept/" not in link:
+                print("Invalid link format. Expected .../login/accept/USER_ID/TOKEN")
+                return False
+                
+            parts = link.split("/login/accept/")
+            if len(parts) < 2:
+                return False
+            
+            path_parts = parts[1].split("/")
+            if len(path_parts) < 2:
+                return False
+                
+            user_id = path_parts[0]
+            token = path_parts[1].split("?")[0] # Remove query params if any
+            
+            # Try multiple endpoints as the correct one is uncertain
+            endpoints = [
+                f"{self.BASE_URL}web/auth/v3/authByRequestToken", # https://api.toogoodtogo.com/api/web/auth/v3/authByRequestToken
+                "https://api.toogoodtogo.com/web/auth/v3/authByRequestToken",
+                "https://space.toogoodtogo.com/api/web/auth/v3/authByRequestToken",
+                "https://space.toogoodtogo.com/web/auth/v3/authByRequestToken"
+            ]
+            
+            payload = {
+                "userId": user_id,
+                "requestToken": token
+            }
+            
+            # Use a browser User-Agent for this web-specific call
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Origin": "https://space.toogoodtogo.com",
+                "Referer": link
+            }
+            
+            print(f"Confirming with User ID: {user_id}...")
+            
+            for url in endpoints:
+                print(f"Trying confirmation URL: {url}")
+                try:
+                    response = requests.post(url, json=payload, headers=headers)
+                    if response.status_code == 200:
+                        print("Confirmation successful!")
+                        return True
+                    else:
+                        print(f"Failed with status {response.status_code} on {url}")
+                except Exception as e:
+                    print(f"Error hitting {url}: {e}")
+            
+            print("All confirmation attempts failed.")
+            return False
+        except Exception as e:
+            print(f"Confirmation error: {e}")
+            return False
+
 
 def main():
     client = TgtgClient()
@@ -211,7 +274,19 @@ def main():
         auth_response = client.login_by_email(email)
         polling_id = auth_response["polling_id"]
         print(f"Please check your email ({email}) and click the login link.")
-        print("Waiting for confirmation...")
+        
+        print("\nNOTE: If clicking the link in the email fails (e.g. 'Something went wrong'),")
+        print("please copy the link address and paste it here.")
+        print("Otherwise, just press Enter after you have clicked the link on your phone.")
+        
+        user_input = input("Link or Enter: ").strip()
+        
+        if user_input and "http" in user_input:
+            client.confirm_by_email_link(user_input)
+            # After manual confirmation, we still need to poll to get the tokens
+            print("Waiting for token generation...")
+        else:
+            print("Waiting for confirmation...")
         
         login_data = client.poll_auth(polling_id, email)
         
