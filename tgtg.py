@@ -3,12 +3,14 @@ import time
 import uuid
 import json
 import urllib.parse
+import os
 
 class TgtgClient:
     BASE_URL = "https://api.toogoodtogo.com/api/"
     DATADOME_URL = "https://api-sdk.datadome.co/sdk/"
     APP_VERSION = "24.11.0"
     USER_AGENT = f"TGTG/{APP_VERSION} Dalvik/2.1.0 (Linux; U; Android 14; Pixel 7 Pro Build/UQ1A.240105.004)"
+    TOKENS_FILE = "tgtg_tokens.json"
     
     def __init__(self):
         self.session = requests.Session()
@@ -23,6 +25,40 @@ class TgtgClient:
         self.refresh_token = None
         self.user_id = None
         self.datadome_cookie = None
+
+    def save_tokens(self):
+        data = {
+            "access_token": self.access_token,
+            "refresh_token": self.refresh_token,
+            "user_id": self.user_id,
+            "datadome_cookie": self.datadome_cookie
+        }
+        try:
+            with open(self.TOKENS_FILE, "w") as f:
+                json.dump(data, f)
+            print("Tokens saved locally.")
+        except Exception as e:
+            print(f"Error saving tokens: {e}")
+
+    def load_tokens(self):
+        if not os.path.exists(self.TOKENS_FILE):
+            return False
+            
+        try:
+            with open(self.TOKENS_FILE, "r") as f:
+                data = json.load(f)
+                self.access_token = data.get("access_token")
+                self.refresh_token = data.get("refresh_token")
+                self.user_id = data.get("user_id")
+                self.datadome_cookie = data.get("datadome_cookie")
+                
+                if self.datadome_cookie:
+                    self.session.cookies.set("datadome", self.datadome_cookie, domain=".toogoodtogo.com")
+                
+                return True
+        except Exception as e:
+            print(f"Error loading tokens: {e}")
+            return False
 
     def _get_headers(self, auth=False):
         headers = {
@@ -90,6 +126,7 @@ class TgtgClient:
                 # Set in session
                 self.session.cookies.set(key, value, domain=".toogoodtogo.com")
                 print("DataDome cookie acquired.")
+                self.save_tokens() # Save cookie if we get a new one
                 return True
             else:
                 print("No cookie in DataDome response.")
@@ -153,6 +190,7 @@ class TgtgClient:
                         self.access_token = data["access_token"]
                         self.refresh_token = data["refresh_token"]
                         self.user_id = data["startup_data"]["user"]["user_id"]
+                        self.save_tokens() # Save after successful login
                         return data
                 elif response.status_code == 202:
                     # Still waiting for confirmation
@@ -180,6 +218,10 @@ class TgtgClient:
             response = self._request("POST", url, json=payload)
             data = response.json()
             self.access_token = data["access_token"]
+            if "refresh_token" in data:
+                self.refresh_token = data["refresh_token"]
+            
+            self.save_tokens() # Save refreshed tokens
             return True
         except Exception as e:
             print(f"Refresh token error: {e}")
@@ -232,13 +274,17 @@ class TgtgClient:
                 "requestToken": token
             }
             
-            # Use a browser User-Agent for this web-specific call
+            # Parse domain from link for Origin
+            parsed_link = urllib.parse.urlparse(link)
+            origin = f"{parsed_link.scheme}://{parsed_link.netloc}" if parsed_link.netloc else "https://space.toogoodtogo.com"
+
+            # Use the App User-Agent for this call
             headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "User-Agent": self.USER_AGENT,
                 "Content-Type": "application/json",
                 "Accept": "application/json",
                 "Accept-Language": "en-US,en;q=0.9",
-                "Origin": "https://space.toogoodtogo.com",
+                "Origin": origin,
                 "Referer": link
             }
             
@@ -247,7 +293,8 @@ class TgtgClient:
             for url in endpoints:
                 print(f"Trying confirmation URL: {url}")
                 try:
-                    response = requests.post(url, json=payload, headers=headers)
+                    # Use self.session to include cookies (DataDome)
+                    response = self.session.post(url, json=payload, headers=headers)
                     if response.status_code == 200:
                         print("Confirmation successful!")
                         return True
@@ -267,61 +314,82 @@ def main():
     client = TgtgClient()
     
     print("--- TooGoodToGo Magic Bag Finder ---")
-    email = input("Enter your email address: ")
     
-    print(f"Requesting login for {email}...")
-    try:
-        auth_response = client.login_by_email(email)
-        polling_id = auth_response["polling_id"]
-        print(f"Please check your email ({email}) and click the login link.")
-        
-        print("\nNOTE: If clicking the link in the email fails (e.g. 'Something went wrong'),")
-        print("please copy the link address and paste it here.")
-        print("Otherwise, just press Enter after you have clicked the link on your phone.")
-        
-        user_input = input("Link or Enter: ").strip()
-        
-        if user_input and "http" in user_input:
-            client.confirm_by_email_link(user_input)
-            # After manual confirmation, we still need to poll to get the tokens
-            print("Waiting for token generation...")
-        else:
-            print("Waiting for confirmation...")
-        
-        login_data = client.poll_auth(polling_id, email)
-        
-        if login_data:
-            print("Login successful!")
+    # Try to load tokens first
+    if client.load_tokens():
+        print("Loaded saved tokens.")
+        if client.refresh_session():
+            print("Session refreshed successfully.")
             print(f"User ID: {client.user_id}")
-            
-            # Default location (e.g., London) if user just presses enter
-            lat_input = input("Enter latitude (default 51.5074): ") or "51.5074"
-            long_input = input("Enter longitude (default -0.1278): ") or "-0.1278"
-            radius_input = input("Enter radius in km (default 5): ") or "5"
-            
-            lat = float(lat_input)
-            long = float(long_input)
-            radius = int(radius_input)
-            
-            print(f"Searching for bags within {radius}km of {lat}, {long}...")
-            items_response = client.get_items(lat, long, radius)
-            
-            items = items_response.get("items", [])
-            print(f"\nFound {len(items)} items:")
-            
-            for item_wrapper in items:
-                item = item_wrapper.get("item", {})
-                store = item_wrapper.get("store", {})
-                items_available = item_wrapper.get("items_available", 0)
-                
-                if items_available > 0:
-                    print(f"- [{items_available} available] {item.get('name')} at {store.get('store_name')}")
-                    price = item.get('item_price', {})
-                    print(f"  Price: {price.get('minor_units', 0) / (10 ** price.get('decimals', 2))} {price.get('code')}")
-                    
+            # Skip login flow
+            do_login = False
         else:
-            print("Login timed out or failed.")
+            print("Session refresh failed. Login required.")
+            do_login = True
+    else:
+        do_login = True
+    
+    if do_login:
+        email = input("Enter your email address: ")
+        
+        print(f"Requesting login for {email}...")
+        try:
+            auth_response = client.login_by_email(email)
+            polling_id = auth_response["polling_id"]
+            print(f"Please check your email ({email}) and click the login link.")
             
+            print("\nNOTE: If clicking the link in the email fails (e.g. 'Something went wrong'),")
+            print("please copy the link address and paste it here.")
+            print("Otherwise, just press Enter after you have clicked the link on your phone.")
+            
+            user_input = input("Link or Enter: ").strip()
+            
+            if user_input and "http" in user_input:
+                client.confirm_by_email_link(user_input)
+                print("Waiting for token generation...")
+            else:
+                print("Waiting for confirmation...")
+            
+            login_data = client.poll_auth(polling_id, email)
+            
+            if login_data:
+                print("Login successful!")
+                print(f"User ID: {client.user_id}")
+            else:
+                print("Login timed out or failed.")
+                return # Exit if login failed
+                
+        except Exception as e:
+            print(f"An error occurred during login: {e}")
+            return
+
+    # Proceed to get items
+    try:
+        # Default location (e.g., London) if user just presses enter
+        lat_input = input("Enter latitude (default 51.5074): ") or "51.5074"
+        long_input = input("Enter longitude (default -0.1278): ") or "-0.1278"
+        radius_input = input("Enter radius in km (default 5): ") or "5"
+        
+        lat = float(lat_input)
+        long = float(long_input)
+        radius = int(radius_input)
+        
+        print(f"Searching for bags within {radius}km of {lat}, {long}...")
+        items_response = client.get_items(lat, long, radius)
+        
+        items = items_response.get("items", [])
+        print(f"\nFound {len(items)} items:")
+        
+        for item_wrapper in items:
+            item = item_wrapper.get("item", {})
+            store = item_wrapper.get("store", {})
+            items_available = item_wrapper.get("items_available", 0)
+            
+            if items_available > 0:
+                print(f"- [{items_available} available] {item.get('name')} at {store.get('store_name')}")
+                price = item.get('item_price', {})
+                print(f"  Price: {price.get('minor_units', 0) / (10 ** price.get('decimals', 2))} {price.get('code')}")
+                
     except Exception as e:
         print(f"An error occurred: {e}")
 
