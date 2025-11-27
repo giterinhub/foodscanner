@@ -8,7 +8,7 @@ import os
 class TgtgClient:
     BASE_URL = "https://api.toogoodtogo.com/api/"
     DATADOME_URL = "https://api-sdk.datadome.co/sdk/"
-    APP_VERSION = "24.11.0"
+    APP_VERSION = "25.9.0"
     USER_AGENT = f"TGTG/{APP_VERSION} Dalvik/2.1.0 (Linux; U; Android 14; Pixel 7 Pro Build/UQ1A.240105.004)"
     TOKENS_FILE = "tgtg_tokens.json"
     
@@ -67,15 +67,13 @@ class TgtgClient:
         if auth and self.access_token:
             headers["Authorization"] = f"Bearer {self.access_token}"
         if self.datadome_cookie:
-            # Add datadome cookie to headers if using requests Session cookie jar isn't enough
-            # But requests Session handles cookies automatically if we set them.
-            # We'll set it in the session cookies.
-            pass
+            headers["Cookie"] = f"datadome={self.datadome_cookie}"
         return headers
 
     def _get_datadome_cookie(self, original_url):
         print("Fetching DataDome cookie...")
         try:
+            time.sleep(1)
             cid = str(uuid.uuid4()).replace("-", "")
             request_url_encoded = urllib.parse.quote(original_url)
             timestamp = int(time.time() * 1000)
@@ -138,29 +136,53 @@ class TgtgClient:
 
     def _request(self, method, url, **kwargs):
         # Wrapper to handle 403 DataDome
+        # Save original kwargs for retry
+        original_kwargs = kwargs.copy()
+        
+        # Add delay to slow down requests
+        time.sleep(3)
+        
         headers = kwargs.pop("headers", {})
-        headers.update(self._get_headers(auth=kwargs.pop("auth_required", False)))
+        auth_required = kwargs.pop("auth_required", False)
+        
+        headers.update(self._get_headers(auth=auth_required))
+        
+        print(f"DEBUG: Requesting {method} {url}")
         
         try:
             response = self.session.request(method, url, headers=headers, **kwargs)
             
             if response.status_code == 403:
-                print("Received 403 Forbidden. Attempting DataDome bypass...")
+                print(f"Received 403 Forbidden on {url}")
+                print(f"Body preview: {response.text[:200]}...") 
+                print("Attempting DataDome bypass...")
+                
+                # Wait before hitting DataDome API
+                time.sleep(2)
+                
                 if self._get_datadome_cookie(url):
                     # Retry
-                    # Update headers with new cookie if needed (session handles it usually)
-                    # But let's make sure we don't reuse the old headers object if it had stale info?
-                    # Actually headers are fresh from _get_headers if we called it again, but we passed it in.
-                    # We should regenerate headers just in case.
-                    headers = kwargs.get("headers", {}) # Original kwargs headers
-                    headers.update(self._get_headers(auth=kwargs.get("auth_required", False))) # Re-add auth/correlation
+                    print("Retrying request with new cookie...")
+                    time.sleep(4) # Wait 4 seconds before retry
+                    
+                    # Reconstruct headers
+                    headers = original_kwargs.get("headers", {})
+                    auth_required = original_kwargs.get("auth_required", False)
+                    headers.update(self._get_headers(auth=auth_required))
                     
                     response = self.session.request(method, url, headers=headers, **kwargs)
+                    
+                    if response.status_code == 403:
+                        print("Retry failed with 403.")
+                        print(f"Retry Body: {response.text[:500]}")
+                        print("Stopping execution to prevent further blocking.")
+                        raise requests.exceptions.HTTPError("403 Forbidden - Blocked by DataDome", response=response)
             
             response.raise_for_status()
             return response
         except requests.exceptions.HTTPError as e:
             # If it's still 403 or other error
+            print(f"Request failed: {e}")
             raise e
 
     def login_by_email(self, email):
@@ -200,6 +222,9 @@ class TgtgClient:
             except Exception as e:
                 # If it's a 403 that wasn't fixed, or other error
                 print(f"Polling error: {e}")
+                if "403" in str(e):
+                    print("Stopping polling due to 403.")
+                    return None
             
             time.sleep(5)
         
@@ -225,6 +250,8 @@ class TgtgClient:
             return True
         except Exception as e:
             print(f"Refresh token error: {e}")
+            if hasattr(e, 'response') and e.response is not None:
+                print(f"Refresh error body: {e.response.text}")
             return False
 
     def get_items(self, lat, long, radius=10, favorites_only=False):
@@ -263,7 +290,6 @@ class TgtgClient:
             
             # Try multiple endpoints as the correct one is uncertain
             endpoints = [
-                f"{self.BASE_URL}web/auth/v3/authByRequestToken", # https://api.toogoodtogo.com/api/web/auth/v3/authByRequestToken
                 "https://api.toogoodtogo.com/web/auth/v3/authByRequestToken",
                 "https://space.toogoodtogo.com/api/web/auth/v3/authByRequestToken",
                 "https://space.toogoodtogo.com/web/auth/v3/authByRequestToken"
@@ -278,6 +304,22 @@ class TgtgClient:
             parsed_link = urllib.parse.urlparse(link)
             origin = f"{parsed_link.scheme}://{parsed_link.netloc}" if parsed_link.netloc else "https://space.toogoodtogo.com"
 
+            # 1. Visit the link first to get cookies/CSRF token
+            print(f"Visiting {link} to establish session...")
+            try:
+                # Use a browser User-Agent for the initial GET to behave like a browser
+                browser_ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                self.session.headers.update({"User-Agent": browser_ua})
+                self.session.get(link)
+                # Restore app UA
+                self.session.headers.update({"User-Agent": self.USER_AGENT})
+            except Exception as e:
+                print(f"Error visiting link: {e}")
+
+            # 2. Extract CSRF token if present
+            csrf_token = self.session.cookies.get("XSRF-TOKEN") or self.session.cookies.get("csrf_token")
+            print(f"CSRF Token found: {csrf_token is not None}")
+
             # Use the App User-Agent for this call
             headers = {
                 "User-Agent": self.USER_AGENT,
@@ -287,6 +329,10 @@ class TgtgClient:
                 "Origin": origin,
                 "Referer": link
             }
+
+            if csrf_token:
+                headers["X-XSRF-TOKEN"] = csrf_token
+                headers["X-CSRF-Token"] = csrf_token
             
             print(f"Confirming with User ID: {user_id}...")
             
@@ -295,6 +341,11 @@ class TgtgClient:
                 try:
                     # Use self.session to include cookies (DataDome)
                     response = self.session.post(url, json=payload, headers=headers)
+                    
+                    if response.status_code != 200:
+                        print(f"Response Headers: {dict(response.headers)}")
+                        print(f"Response Body: {response.text}")
+
                     if response.status_code == 200:
                         print("Confirmation successful!")
                         return True
